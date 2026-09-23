@@ -88,23 +88,20 @@ function dlFile(blob,name){
   LS("z_lastBackup",TD());
 }
 
-// === ANLIK SENKRONİZASYON (GitHub özel depo, kayıt bazlı birleştirme) ===
-var GH_DATA_REPO="sondaj-veri",GH_FILE="data.json",GH_OLD="onurkarakuzu-sudo/sondaj";
-var _sy={busy:false,again:false,timer:null,poll:null,sha:null,uiPending:false,err:"",state:"ok",tries:0,delOld:null};
-var _repoOk=false,_snap=null;
-function ghToken(){return LS("z_ghtoken")||""}
-function ghActive(){return!!ghToken()}
-function ghUser(){return LS("z_ghuser")||""}
-function ghRepo(){return ghUser()+"/"+GH_DATA_REPO}
-function b64e(s){return btoa(unescape(encodeURIComponent(s)))}
-function b64d(s){return decodeURIComponent(escape(atob(s.replace(/\n/g,""))))}
+// === ANLIK SENKRONİZASYON (Google Drive, kayıt bazlı birleştirme) ===
+var DRIVE_URL="https://script.google.com/macros/s/AKfycbz1QkDYgmHV-P1viWthX4SlW-2sNKgfbLKvZ-a68SoMuo49CdBYXT9OushUinHpGwe-GQ/exec";
+var _sy={busy:false,again:false,timer:null,poll:null,uiPending:false,err:"",state:"ok"};
+var _snap=null,_key=null,_out=LS("z_out")||{};
+function ghActive(){return/^https:\/\//.test(DRIVE_URL)}
+function driveOn(){return ghActive()&&!!_key}
+function saveOut(){LS("z_out",_out)}
 function deviceName(){return/iPhone|iPad|Android/i.test(navigator.userAgent)?"telefon":"bilgisayar"}
-function gh(method,path,body){
-  var o={method:method,cache:"no-store",headers:{"Authorization":"token "+ghToken(),"Accept":"application/vnd.github+json"}};
-  if(body){o.headers["Content-Type"]="application/json";o.body=JSON.stringify(body)}
-  var url="https://api.github.com"+path+(method==="GET"?(path.indexOf("?")>=0?"&":"?")+"_="+Date.now():"");
-  return fetch(url,o).then(function(r){return r.text().then(function(t){var j=null;try{j=t?JSON.parse(t):null}catch(e){}return{status:r.status,data:j}})})
-}
+function mkKey(pw){return crypto.subtle.digest("SHA-256",new TextEncoder().encode(pw+"|sondaj-takip")).then(function(b){return Array.from(new Uint8Array(b)).map(function(x){return("0"+x.toString(16)).slice(-2)}).join("")})}
+function api(op,body){
+  body=body||{};body.op=op;body.key=_key;
+  return fetch(DRIVE_URL,{method:"POST",redirect:"follow",body:JSON.stringify(body),headers:{"Content-Type":"text/plain;charset=utf-8"}})
+    .then(function(r){if(!r.ok)throw{msg:"Sunucu hatası "+r.status};return r.json()})}
+function chk(r){if(r&&r.ok)return r;if(r&&r.err==="auth")throw{auth:1};if(r&&r.err==="locked")throw{locked:1};throw{msg:(r&&r.err)||"Sunucu yanıt vermedi"}}
 
 // Veriyi kayıt kayıt "anahtar → değer" haritasına çevir
 function flatOf(st){var o={};
@@ -120,133 +117,114 @@ function unflat(o){var st={jobs:[],checks:{},tahsilat:{},rehber:{},trash:[]};
     else if(p==="t")st.tahsilat[key]=JSON.parse(v);else if(p==="r")st.rehber[key]=JSON.parse(v);
     else if(p==="x")st.trash.push(JSON.parse(v))});
   return st}
-function sameMap(a,b){var ka=Object.keys(a),kb=Object.keys(b);if(ka.length!==kb.length)return false;for(var i=0;i<ka.length;i++)if(a[ka[i]]!==b[ka[i]])return false;return true}
 
-// Her kayıt değişikliğine zaman damgası bas
+// Her kayıt değişikliğine zaman damgası bas, gönderilecekler listesine ekle
 function stampChanges(){
   var f=flatOf(S),now=Date.now(),ch=false;
   if(!_snap)_snap=LS("z_snap")||{};
-  Object.keys(f).forEach(function(k){if(_snap[k]!==f[k]){S.mt[k]=now;ch=true}});
-  Object.keys(_snap).forEach(function(k){if(!(k in f)){S.mt[k]=now;ch=true}});
-  _snap=f;LS("z_snap",f);LS("z_mt",S.mt);if(ch)LS("z_dirty",1);
+  Object.keys(f).forEach(function(k){if(_snap[k]!==f[k]){S.mt[k]=now;_out[k]=1;ch=true}});
+  Object.keys(_snap).forEach(function(k){if(!(k in f)){S.mt[k]=now;_out[k]=1;ch=true}});
+  _snap=f;LS("z_snap",f);LS("z_mt",S.mt);if(ch)saveOut();
   return ch}
-
-// İki cihazın verisini kayıt bazında birleştir: her kayıtta en son değiştirilen kazanır
-function mergeStates(rem){
-  var lf=flatOf(S),rf=flatOf(rem),lm=S.mt||{},rm=rem.mt||{},out={},mt={},keys={};
-  [lf,rf,lm,rm].forEach(function(o){Object.keys(o).forEach(function(k){keys[k]=1})});
-  Object.keys(keys).forEach(function(k){
-    var lt=lm[k]||0,rt=rm[k]||0,useR;
-    if(rt!==lt)useR=rt>lt;else useR=(k in rf)||!(k in lf);
-    var src=useR?rf:lf,t=useR?rt:lt;
-    if(k in src)out[k]=src[k];
-    if(t)mt[k]=t});
-  return{flat:out,mt:mt}}
 function applyFlat(f,mt){
   var st=unflat(f);S.jobs=st.jobs;S.checks=st.checks;S.tahsilat=st.tahsilat;S.rehber=st.rehber;S.trash=st.trash;S.mt=mt;
   origSV();_snap=f;LS("z_snap",f);LS("z_mt",mt)}
+// Dosyadan birleştirme (JSON yedek yüklerken)
+function mergeStates(rem){
+  var lf=flatOf(S),rf=flatOf(rem),lm=S.mt||{},rm=rem.mt||{},out={},mt={},keys={};
+  [lf,rf,lm,rm].forEach(function(o){Object.keys(o).forEach(function(k){keys[k]=1})});
+  Object.keys(keys).forEach(function(k){var lt=lm[k]||0,rt=rm[k]||0,useR;
+    if(rt!==lt)useR=rt>lt;else useR=(k in rf)||!(k in lf);
+    var src=useR?rf:lf,t=useR?rt:lt;if(k in src)out[k]=src[k];if(t)mt[k]=t});
+  return{flat:out,mt:mt}}
+// Buluttan gelen değişiklikleri uygula: her kayıtta en son değiştirilen kazanır
+function applyRemote(ch){
+  var keys=Object.keys(ch||{});if(!keys.length)return{};
+  var f=flatOf(S),applied={},n=0;
+  keys.forEach(function(k){var v=ch[k][0],t=ch[k][1];
+    if(t>(S.mt[k]||0)){if(v===null)delete f[k];else f[k]=v;S.mt[k]=t;applied[k]=1;delete _out[k];n++}});
+  if(n){applyFlat(f,S.mt);saveOut();uiRefresh()}
+  return applied}
 function isTyping(){var a=document.activeElement;return!!(a&&/INPUT|TEXTAREA|SELECT/.test(a.tagName)&&a.id!=="searchInp"&&a.id!=="pinInp")}
 function uiRefresh(){if(S.locked)return;if(isTyping())_sy.uiPending=true;else R()}
 
-function ensureRepo(){
-  if(_repoOk&&ghUser())return Promise.resolve();
-  var p=ghUser()?Promise.resolve():gh("GET","/user").then(function(r){
-    if(r.status===401)throw{auth:1};
-    if(!r.data||!r.data.login)throw{msg:"Kullanıcı bilgisi alınamadı"};
-    LS("z_ghuser",r.data.login)});
-  return p.then(function(){return gh("GET","/repos/"+ghRepo())}).then(function(r){
-    if(r.status===200){_repoOk=true;return}
-    if(r.status===401)throw{auth:1};
-    if(r.status===404)return gh("POST","/user/repos",{name:GH_DATA_REPO,private:true,auto_init:true,description:"Sondaj Takip verileri (ozel)"}).then(function(c){
-      if(c.status!==201)throw{msg:"Özel depo oluşturulamadı ("+c.status+")"};
-      _repoOk=true;return migrateOld()});
-    throw{msg:"Depo erişimi "+r.status}})}
-
-// Eski herkese açık depodaki data.json'u özel depoya taşı
-function migrateOld(){
-  return gh("GET","/repos/"+GH_OLD+"/contents/"+GH_FILE).then(function(r){
-    if(r.status!==200||!r.data||!r.data.sha)return;
-    var old=null;try{old=r.data.content?JSON.parse(b64d(r.data.content)):null}catch(e){}
-    if(old&&old.jobs){var m=mergeStates(old);applyFlat(m.flat,m.mt)}
-    _sy.delOld=r.data.sha})}
+function pushOut(){
+  var f=flatOf(S),all=Object.keys(_out),keys=all.slice(0,2500),ch={},sent={};
+  keys.forEach(function(k){var t=S.mt[k]||1;ch[k]=[k in f?f[k]:null,t];sent[k]=t});
+  return api("push",{since:LS("z_ver")||0,changes:ch,more:all.length>keys.length,device:deviceName()}).then(chk).then(function(r){
+    keys.forEach(function(k){if((S.mt[k]||1)===sent[k])delete _out[k]});saveOut();
+    applyRemote(r.changes);LS("z_ver",r.ver);
+    if(Object.keys(_out).length)_sy.again=true})}
 
 function syncNow(){
-  if(!ghActive())return;
+  if(!driveOn()){setBadge(ghActive()?"nokey":"ok");return}
   if(_sy.busy){_sy.again=true;return}
   _sy.busy=true;setBadge("busy");
-  ensureRepo().then(function(){return gh("GET","/repos/"+ghRepo()+"/contents/"+GH_FILE)}).then(function(res){
-    if(res.status===401)throw{auth:1};
-    if(res.status===404){_sy.sha=null;return{}}
-    if(res.status!==200||!res.data)throw{msg:"Okuma hatası "+res.status};
-    _sy.sha=res.data.sha;
-    if(res.data.content)return JSON.parse(b64d(res.data.content));
-    if(res.data.download_url)return fetch(res.data.download_url,{cache:"no-store"}).then(function(x){return x.json()});
-    return{};
-  }).then(function(remote){
-    stampChanges();
-    var m=mergeStates(remote),rf=flatOf(remote);
-    var needPush=!sameMap(m.flat,rf)||!sameMap(m.mt,remote.mt||{});
-    if(!sameMap(m.flat,flatOf(S))){applyFlat(m.flat,m.mt);uiRefresh()}else{S.mt=m.mt;LS("z_mt",m.mt)}
-    if(!needPush)return true;
-    var st=unflat(m.flat);
-    var body={message:"eşitleme ("+deviceName()+") "+new Date().toLocaleString("tr-TR"),
-      content:b64e(JSON.stringify({version:4,sync:new Date().toISOString(),jobs:st.jobs,checks:st.checks,tahsilat:st.tahsilat,rehber:st.rehber,trash:st.trash,mt:m.mt}))};
-    if(_sy.sha)body.sha=_sy.sha;
-    return gh("PUT","/repos/"+ghRepo()+"/contents/"+GH_FILE,body).then(function(r){
-      if(r.status===200||r.status===201){_sy.sha=r.data.content.sha;return true}
-      if(r.status===401)throw{auth:1};
-      if((r.status===409||r.status===422)&&_sy.tries<4){_sy.tries++;_sy.again=true;return false}
-      throw{msg:"Yazma hatası "+r.status}})
-  }).then(function(ok){
-    _sy.busy=false;
-    if(ok){_sy.tries=0;_sy.err="";LS("z_lastSync",new Date().toISOString());if(!_sy.again)LS("z_dirty",0);setBadge("ok");afterSync()}
-    if(_sy.again){_sy.again=false;setTimeout(syncNow,400)}
+  stampChanges();
+  var p;
+  if(LS("z_ver")===null){
+    // Bu cihazın ilk bağlantısı: önce buluttakini al, sonra sadece bu cihazda olanları gönder
+    var lf=flatOf(S),localT={};
+    Object.keys(lf).forEach(function(k){localT[k]=S.mt[k]||1});
+    Object.keys(S.mt).forEach(function(k){if(!(k in lf))localT[k]=S.mt[k]});
+    p=api("pull",{since:0}).then(chk).then(function(r){
+      var applied=applyRemote(r.changes);
+      Object.keys(localT).forEach(function(k){if(!applied[k]){_out[k]=1;if(!S.mt[k])S.mt[k]=localT[k]}});
+      LS("z_mt",S.mt);saveOut();LS("z_ver",r.ver);
+      return Object.keys(_out).length?pushOut():null})
+  }else if(Object.keys(_out).length){p=pushOut()}
+  else{p=api("pull",{since:LS("z_ver")}).then(chk).then(function(r){applyRemote(r.changes);LS("z_ver",r.ver)})}
+  p.then(function(){
+    _sy.busy=false;_sy.err="";LS("z_lastSync",new Date().toISOString());setBadge("ok");
+    if(_sy.again){_sy.again=false;setTimeout(syncNow,300)}
   }).catch(function(e){
-    _sy.busy=false;_sy.tries=0;
-    if(e&&e.auth){_sy.err="Token geçersiz veya süresi dolmuş";setBadge("auth")}
+    _sy.busy=false;_sy.again=false;
+    if(e&&e.auth){_sy.err="Şifre buluttakiyle aynı değil";setBadge("auth")}
+    else if(e&&e.locked){_sy.err="Çok fazla hatalı deneme — 1 saat bekleyin";setBadge("err")}
     else{_sy.err=(e&&e.msg)||"İnternet bağlantısı yok";setBadge(navigator.onLine?"err":"off")}
-  })}
+    uiRefreshIfAyar()})}
+function uiRefreshIfAyar(){if(S.view==="ayar"&&!isTyping()&&!S.locked)R()}
 
-function afterSync(){
-  // Eski açık depodaki veriyi sil (özel depoya başarıyla yazıldıktan sonra)
-  if(_sy.delOld){var sha=_sy.delOld;_sy.delOld=null;gh("DELETE","/repos/"+GH_OLD+"/contents/"+GH_FILE,{message:"Veriler özel depoya taşındı",sha:sha})}
-  // Günlük yedek: her gün bir kopya yedekler/ klasörüne
-  var d=TD();if(LS("z_lastSnap")===d)return;
-  gh("PUT","/repos/"+ghRepo()+"/contents/yedekler/"+d+".json",{message:"günlük yedek "+d,content:b64e(JSON.stringify(getSyncData()))}).then(function(r){if(r.status===201||r.status===422)LS("z_lastSnap",d)})}
-
-function listSnaps(cb){gh("GET","/repos/"+ghRepo()+"/contents/yedekler").then(function(r){cb(r.status===200&&Array.isArray(r.data)?r.data.map(function(f){return f.name}).sort().reverse():[])}).catch(function(){cb(null)})}
+function listSnaps(cb){api("backups").then(chk).then(function(r){cb(r.list||[])}).catch(function(){cb(null)})}
 function restoreSnap(name){
-  if(!confirm(name.replace(".json","")+" tarihli yedek yüklenecek.\nMevcut veriler bu yedekle değiştirilecek ve diğer cihaza da aktarılacak.\n\nDevam?"))return;
-  gh("GET","/repos/"+ghRepo()+"/contents/yedekler/"+name).then(function(r){
-    if(r.status!==200||!r.data){alert("Yedek okunamadı");return}
-    var d=r.data.content?JSON.parse(b64d(r.data.content)):null;if(!d){alert("Yedek okunamadı");return}
+  var gun=name.replace("yedek_","").replace(".json","");
+  if(!confirm(gun+" tarihli yedek yüklenecek.\nMevcut veriler bu yedekle değiştirilecek ve diğer cihaza da aktarılacak.\n\nDevam?"))return;
+  api("backup",{name:name}).then(chk).then(function(r){var d=r.data;
     S.jobs=d.jobs||[];S.checks=d.checks||{};S.tahsilat=d.tahsilat||{};S.rehber=d.rehber||{};S.trash=d.trash||[];
-    SV();R();alert("Yedek yüklendi: "+S.jobs.length+" kayıt")})}
+    SV();R();alert("Yedek yüklendi: "+S.jobs.length+" kayıt")}).catch(function(){alert("Yedek okunamadı")})}
+function changeKey(pw){
+  mkKey(pw).then(function(nk){
+    if(!driveOn()){_key=nk;return}
+    api("rekey",{newKey:nk}).then(chk).then(function(){_key=nk;alert("Şifre bu cihazda ve bulutta değişti.\nDiğer cihazda da yeni şifreyle giriş yapın.")})
+      .catch(function(){alert("Şifre bu cihazda değişti ama buluta iletilemedi.\nİnternet bağlantısını kontrol edip tekrar deneyin.")})})}
+function useCloudPw(pw){
+  mkKey(pw).then(function(k){_key=k;localStorage.setItem("z_pw",pw);_sy.err="";syncNow();setTimeout(uiRefreshIfAyar,2500)})}
 
 function paintBadge(el){
   if(!el)return;var dot=el.firstChild,txt=el.lastChild;if(!dot||!txt)return;
   var st=_sy.state,col,t,anim="none";
   if(st==="busy"){col="#f97316";t="Eşitleniyor…"}
-  else if(st==="auth"){col="#ef4444";t="Token geçersiz"}
+  else if(st==="auth"){col="#ef4444";t="Şifre uyuşmuyor"}
+  else if(st==="nokey"){col="#94a3b8";t="Şifreyle giriş gerekli"}
   else if(st==="err"){col="#ef4444";t="Hata — tekrar denenecek"}
-  else if(st==="off"){col="#94a3b8";t=LS("z_dirty")?"Çevrimdışı · bekliyor":"Çevrimdışı"}
-  else{var ls=LS("z_lastSync");col="#22c55e";anim="pulse 2s infinite";t="Eşit ✓ "+(ls?new Date(ls).toLocaleTimeString("tr-TR",{hour:"2-digit",minute:"2-digit"}):"")}
+  else if(st==="off"){col="#94a3b8";t=Object.keys(_out).length?"Çevrimdışı · bekliyor":"Çevrimdışı"}
+  else{var ls=LS("z_lastSync");col="#22c55e";anim="pulse 2s infinite";t="Drive ✓ "+(ls?new Date(ls).toLocaleTimeString("tr-TR",{hour:"2-digit",minute:"2-digit"}):"")}
   dot.style.background=col;dot.style.animation=anim;txt.textContent=t;txt.style.color=col}
 function setBadge(st){_sy.state=st;paintBadge(document.getElementById("syncStatus"))}
-function schedSync(){if(!ghActive())return;clearTimeout(_sy.timer);_sy.timer=setTimeout(syncNow,1200)}
+function schedSync(){if(!driveOn())return;clearTimeout(_sy.timer);_sy.timer=setTimeout(syncNow,1200)}
 function startGhSync(){
   if(_sy.poll)clearInterval(_sy.poll);
   if(!ghActive())return;
   syncNow();
-  _sy.poll=setInterval(function(){if(!document.hidden)syncNow()},15000)}
-document.addEventListener("visibilitychange",function(){if(!document.hidden&&!S.locked&&ghActive())syncNow()});
-window.addEventListener("online",function(){if(!S.locked&&ghActive())syncNow()});
-window.addEventListener("offline",function(){if(ghActive())setBadge("off")});
+  _sy.poll=setInterval(function(){if(!document.hidden&&!S.locked)syncNow()},15000)}
+document.addEventListener("visibilitychange",function(){if(!document.hidden&&!S.locked&&driveOn())syncNow()});
+window.addEventListener("online",function(){if(!S.locked&&driveOn())syncNow()});
+window.addEventListener("offline",function(){if(driveOn())setBadge("off")});
 setInterval(function(){if(_sy.uiPending&&!isTyping()){_sy.uiPending=false;R()}},1500);
 
 function origSV(){LS("z_jb",S.jobs);LS("z_ck",S.checks);LS("z_th",S.tahsilat);LS("z_tr",S.trash);LS("z_rh",S.rehber);LS("z_sync",new Date().toISOString())}
 function smartMerge(d){
-  if(d.mt){var m=mergeStates(d);applyFlat(m.flat,m.mt);LS("z_dirty",1);schedSync();R();return"Birleştirildi: "+S.jobs.length+" kayıt"}
+  if(d.mt){var bf=flatOf(S),m=mergeStates(d);applyFlat(m.flat,m.mt);Object.keys(m.mt).forEach(function(k){if(bf[k]!==m.flat[k])_out[k]=1});saveOut();schedSync();R();return"Birleştirildi: "+S.jobs.length+" kayıt"}
   if(!confirm("Bu dosyadaki "+(d.jobs||[]).length+" kayıt, mevcut "+S.jobs.length+" kaydın yerine yüklenecek.\nDevam?"))return"İptal edildi";
   S.jobs=d.jobs||[];S.checks=d.checks||{};S.tahsilat=d.tahsilat||{};S.rehber=d.rehber||{};S.trash=d.trash||[];
   SV();R();return"Yüklendi: "+S.jobs.length+" kayıt"}
@@ -328,7 +306,7 @@ function R(){
   if(ghActive()){
     syncBdg=STY(E("div",""),{display:"flex",alignItems:"center",gap:"4px",padding:"4px 10px",borderRadius:"20px",background:dk?"#1e293b":"#f1f5f9",border:"1px solid "+(dk?"#334155":"#e2e8f0"),cursor:"pointer",minHeight:"36px"});
     var dot=STY(E("span",""),{width:"8px",height:"8px",borderRadius:"50%",background:"#22c55e",display:"inline-block",animation:"pulse 2s infinite"});
-    var stxt=STY(E("span","","Sync aktif"),{fontSize:"9px",fontWeight:"700",color:"#22c55e"});
+    var stxt=STY(E("span","","Drive"),{fontSize:"9px",fontWeight:"700",color:"#22c55e"});
     syncBdg.id="syncStatus";
     ADD(syncBdg,dot,stxt);
     ON(syncBdg,"click",function(){syncNow()});paintBadge(syncBdg);
@@ -343,7 +321,7 @@ function R(){
     if(!nw||nw.length<3){alert("Şifre en az 3 karakter olmalı");return}
     var nw2=prompt("Yeni şifreyi tekrar girin:");
     if(nw!==nw2){alert("Şifreler eşleşmiyor!");return}
-    localStorage.setItem("z_pw",nw);alert("Şifre başarıyla değiştirildi!")
+    localStorage.setItem("z_pw",nw);changeKey(nw);if(!driveOn())alert("Şifre başarıyla değiştirildi!")
   });
   ADD(hr,nbtn,pkBtn,tbtn,lbtn);if(syncBdg)ADD(hr,syncBdg);ADD(hdr,hl,hr);ADD(app,hdr);
   // Pulse animation
@@ -525,7 +503,7 @@ function R(){
       var n=$("pw_new").value,c=$("pw_conf").value;
       if(!n||n.length<3){alert("Şifre en az 3 karakter olmalı");return}
       if(n!==c){alert("Şifreler eşleşmiyor");return}
-      localStorage.setItem("z_pw",n);alert("Şifre başarıyla değiştirildi!")
+      localStorage.setItem("z_pw",n);changeKey(n);if(!driveOn())alert("Şifre başarıyla değiştirildi!")
     });
     ADD(pwGrid,pwNew,pwConf,pwBtn);ADD(pw,pwGrid);ADD(cnt,pw);
 
@@ -541,46 +519,47 @@ function R(){
 
     // === CANLI SENKRONİZASYON ===
     var sy=STY(E("div","cd"),{padding:"14px"});
-    var hasToken=ghActive(),authBad=_sy.state==="auth";
     var lsync2=LS("z_lastSync");var syncSt=lsync2?new Date(lsync2).toLocaleString("tr-TR"):"—";
-    var h='<div style="font-size:12px;font-weight:700;margin-bottom:8px">⚡ TELEFON + BİLGİSAYAR ANLIK EŞİTLEME</div>';
-    if(hasToken&&!authBad){
-      h+='<div style="font-size:10px;color:#22c55e;font-weight:700;margin-bottom:6px">✅ AKTİF — değişiklik 1-2 sn içinde gönderilir, diğer cihaz en geç 15 sn içinde alır</div>'
-       +'<div style="font-size:9px;color:#94a3b8;line-height:1.8">Son eşitleme: <b>'+syncSt+'</b><br>Veri deposu: <b>'+(ghUser()?ghUser()+"/"+GH_DATA_REPO:"hazırlanıyor…")+'</b> 🔒 özel<br>Son günlük yedek: <b>'+(LS("z_lastSnap")||"—")+'</b>'
-       +(_sy.err?'<br><span style="color:#ef4444">Son hata: '+_sy.err+'</span>':'')+'</div>';
+    var h='<div style="font-size:12px;font-weight:700;margin-bottom:8px">⚡ TELEFON + BİLGİSAYAR ANLIK EŞİTLEME (Google Drive)</div>';
+    var syState=_sy.state;
+    if(!ghActive()){
+      h+='<div style="font-size:10px;color:#f97316">Drive bağlantısı henüz kurulmadı.</div>';
+    }else if(syState==="auth"){
+      h+='<div style="font-size:10px;color:#ef4444;font-weight:700;margin-bottom:6px">⚠️ Bu cihazın şifresi buluttakiyle aynı değil</div>'
+       +'<div style="font-size:9px;color:#94a3b8;line-height:1.7;margin-bottom:6px">Diğer cihazda giriş yaptığınız şifreyi aşağıya yazın. Bu cihazın şifresi de o olur ve eşitleme başlar.</div>';
+    }else if(syState==="nokey"){
+      h+='<div style="font-size:10px;color:#f97316;margin-bottom:6px">Eşitleme için uygulamadan çıkıp şifrenizle tekrar giriş yapın.</div>';
     }else{
-      h+=(authBad?'<div style="font-size:10px;color:#ef4444;font-weight:700;margin-bottom:6px">⚠️ Token geçersiz veya süresi dolmuş — yeni token girin (veriler bu cihazda güvende)</div>'
-        :'<div style="font-size:10px;color:#f97316;margin-bottom:6px">Telefon ve bilgisayarı eşitlemek için her cihazda bir kez GitHub token girin.</div>')
-       +'<div style="font-size:9px;color:#64748b;margin-bottom:8px;line-height:1.7">1. <b>github.com/settings/tokens/new</b> açın<br>2. Note: <b>sondaj</b> — Expiration: <b>No expiration</b><br>3. Sadece <b>repo</b> kutusunu işaretleyin → <b>Generate token</b><br>4. Kodu kopyalayıp aşağıya yapıştırın</div>';
+      var bekleyen=Object.keys(_out).length;
+      h+='<div style="font-size:10px;color:#22c55e;font-weight:700;margin-bottom:6px">✅ AKTİF — değişiklik 1-2 sn içinde Drive\'a gider, diğer cihaz en geç 15 sn içinde alır</div>'
+       +'<div style="font-size:9px;color:#94a3b8;line-height:1.8">Son eşitleme: <b>'+syncSt+'</b><br>Konum: <b>Google Drive › Sondaj Takip</b><br>Günlük yedek: <b>Sondaj Takip › Yedekler</b>'
+       +(bekleyen?'<br>Gönderilmeyi bekleyen: <b>'+bekleyen+'</b>':'')
+       +(_sy.err?'<br><span style="color:#ef4444">Son hata: '+_sy.err+'</span>':'')+'</div>';
     }
     sy.innerHTML=h;
     var syRow=STY(E("div"),{display:"flex",gap:"6px",flexWrap:"wrap",marginTop:"8px"});
-    if(!hasToken||authBad){
-      var tkInp=E("input","inp");tkInp.type="text";tkInp.placeholder="ghp_... token yapıştırın";tkInp.id="gh_token";tkInp.autocomplete="off";
-      STY(tkInp,{marginBottom:"6px",fontFamily:"monospace",fontSize:"12px",textTransform:"none"});
-      sy.appendChild(tkInp);
-      var syBt=E("button","btn","🔗 Bağlan");STY(syBt,{background:"#3b82f6",flex:"1"});
-      ON(syBt,"click",function(){var t=$("gh_token").value.trim();if(!t||t.length<20){alert("Geçerli bir token girin");return}
-        LS("z_ghtoken",t);LS("z_ghuser","");_repoOk=false;_sy.err="";_sy.state="busy";startGhSync();R()});
-      ADD(syRow,syBt);
-    }else{
+    if(ghActive()&&syState==="auth"){
+      var cpw=E("input","inp");cpw.type="password";cpw.placeholder="Diğer cihazdaki şifre";cpw.id="cloud_pw";
+      STY(cpw,{marginBottom:"6px",textTransform:"none"});sy.appendChild(cpw);
+      var cpb=E("button","btn","🔗 Bu şifreyle eşitle");STY(cpb,{background:"#3b82f6",flex:"1"});
+      ON(cpb,"click",function(){var v=$("cloud_pw").value;if(!v){alert("Şifreyi yazın");return}useCloudPw(v)});
+      ADD(syRow,cpb);
+    }else if(ghActive()&&syState!=="nokey"){
       var syNow=E("button","btn","🔄 Şimdi Eşitle");STY(syNow,{background:"#3b82f6",flex:"1"});
-      ON(syNow,"click",function(){syncNow()});
+      ON(syNow,"click",function(){syncNow();setTimeout(uiRefreshIfAyar,2500)});
       var syBk=E("button","btn",S.showSnaps?"🗂 Yedekleri Gizle":"🗂 Günlük Yedekler");STY(syBk,{background:"#0d9488",flex:"1"});
       ON(syBk,"click",function(){S.showSnaps=!S.showSnaps;R()});
-      var syDis=E("button","btn","❌ Bağlantıyı Kes");STY(syDis,{background:"#ef4444",flex:"1"});
-      ON(syDis,"click",function(){if(confirm("Bu cihazda eşitleme kapatılsın mı?\n(Veriler silinmez.)")){LS("z_ghtoken","");LS("z_ghuser","");_repoOk=false;if(_sy.poll)clearInterval(_sy.poll);R()}});
-      ADD(syRow,syNow,syBk,syDis);
+      ADD(syRow,syNow,syBk);
     }
     ADD(sy,syRow);
-    if(S.showSnaps&&hasToken&&!authBad){
+    if(S.showSnaps&&driveOn()){
       var sl=STY(E("div","","Yedekler yükleniyor…"),{marginTop:"10px",fontSize:"10px",color:"#94a3b8"});
       ADD(sy,sl);
       listSnaps(function(names){
         if(names===null){sl.textContent="Yedek listesi alınamadı";return}
-        if(!names.length){sl.textContent="Henüz yedek yok — ilk yedek bugün otomatik alınacak";return}
+        if(!names.length){sl.textContent="Henüz yedek yok — ilk yedek yarın ilk değişiklikte alınacak";return}
         sl.innerHTML='<div style="margin-bottom:4px">Geri yüklemek istediğiniz günü seçin:</div>';
-        names.slice(0,60).forEach(function(n){var b=E("button","btn","↩ "+n.replace(".json",""));STY(b,{background:"#334155",margin:"3px",fontSize:"11px",minHeight:"34px",padding:"6px 10px"});
+        names.slice(0,60).forEach(function(n){var b=E("button","btn","↩ "+n.replace("yedek_","").replace(".json",""));STY(b,{background:"#334155",margin:"3px",fontSize:"11px",minHeight:"34px",padding:"6px 10px"});
           ON(b,"click",function(){restoreSnap(n)});ADD(sl,b)})});
     }
     ADD(cnt,sy);
@@ -619,7 +598,7 @@ function R(){
 
     // === HAKKINDA ===
     var ab=STY(E("div","cd"),{padding:"14px"});
-    ab.innerHTML='<div style="font-size:12px;font-weight:700;margin-bottom:8px">ℹ️ HAKKINDA</div><div style="font-size:10px;color:#94a3b8;line-height:1.6">Sondaj Cari Hesap & İş Takip v5.0<br>Anlık eşitleme: özel GitHub deposu, kayıt bazlı birleştirme.<br>Her değişiklik 1-2 sn içinde gönderilir; her gün otomatik yedek alınır.<br><br>Master şifre sıfırlama: <b>SONKA1500</b><br>GitHub: github.com/onurkarakuzu-sudo/sondaj</div>';
+    ab.innerHTML='<div style="font-size:12px;font-weight:700;margin-bottom:8px">ℹ️ HAKKINDA</div><div style="font-size:10px;color:#94a3b8;line-height:1.6">Sondaj Cari Hesap & İş Takip v6.0<br>Anlık eşitleme: Google Drive (Sondaj Takip klasörü), kayıt bazlı birleştirme.<br>Her değişiklik 1-2 sn içinde gönderilir; her gün Drive\'a otomatik yedek alınır.<br><br>Master şifre sıfırlama: <b>SONKA1500</b><br>GitHub: github.com/onurkarakuzu-sudo/sondaj</div>';
     ADD(cnt,ab);
   }
 
@@ -826,8 +805,8 @@ function delJob(id){
 function doLogin(){
   var pi=$("pinInp");if(!pi)return;var v=pi.value;if(!v)return;
   var saved=localStorage.getItem("z_pw");
-  if(!saved||saved==="EMPTY"){localStorage.setItem("z_pw",v);S.locked=false;R();startGhSync()}
-  else if(v===saved){S.locked=false;R();startGhSync()}
+  if(!saved||saved==="EMPTY"){localStorage.setItem("z_pw",v);S.locked=false;R();mkKey(v).then(function(k){_key=k;startGhSync()})}
+  else if(v===saved){S.locked=false;R();mkKey(v).then(function(k){_key=k;startGhSync()})}
   else{pi.value="";pi.style.borderColor="#ef4444";setTimeout(function(){if(pi)pi.style.borderColor=""},1500)}
 }
 
