@@ -97,10 +97,15 @@ function driveOn(){return ghActive()&&!!_key}
 function saveOut(){LS("z_out",_out)}
 function deviceName(){return/iPhone|iPad|Android/i.test(navigator.userAgent)?"telefon":"bilgisayar"}
 function mkKey(pw){return crypto.subtle.digest("SHA-256",new TextEncoder().encode(pw+"|sondaj-takip")).then(function(b){return Array.from(new Uint8Array(b)).map(function(x){return("0"+x.toString(16)).slice(-2)}).join("")})}
-function api(op,body){
-  body=body||{};body.op=op;body.key=_key;
+function api(op,body,tries){
+  body=body||{};body.op=op;body.key=_key;tries=tries||0;
   return fetch(DRIVE_URL,{method:"POST",redirect:"follow",body:JSON.stringify(body),headers:{"Content-Type":"text/plain;charset=utf-8"}})
-    .then(function(r){if(!r.ok)throw{msg:"Sunucu hatası "+r.status};return r.json()})}
+    .then(function(r){if(!r.ok)throw{msg:"Sunucu hatası "+r.status,retry:1};return r.text()})
+    .then(function(t){try{return JSON.parse(t)}catch(e){throw{msg:"Sunucu yanıtı okunamadı",retry:1}}})
+    .catch(function(e){
+      // Google'ın yanıt sunucusu arada 404 verebiliyor; istekler tekrarlanabilir olduğu için yeniden dene
+      if(tries<4&&(!e||e.retry||e instanceof TypeError))return new Promise(function(ok){setTimeout(ok,800*(tries+1))}).then(function(){return api(op,body,tries+1)});
+      throw e})}
 function chk(r){if(r&&r.ok)return r;if(r&&r.err==="auth")throw{auth:1};if(r&&r.err==="locked")throw{locked:1};throw{msg:(r&&r.err)||"Sunucu yanıt vermedi"}}
 
 // Veriyi kayıt kayıt "anahtar → değer" haritasına çevir
